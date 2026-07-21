@@ -10,10 +10,10 @@ import trimesh
 from PIL import Image
 import imagehash
 
-st.set_page_config(page_title="BeamNG Ultra Mod Inspector", layout="wide")
+st.set_page_config(page_title="BeamNG Comprehensive Mod Inspector", layout="wide")
 
-st.title("🛡️ BeamNG.drive Ultra Theft Inspector")
-st.write("Upload ONE suspect mod ZIP and check it against MULTIPLE original mod ZIPs for an exhaustive, line-by-line inspection.")
+st.title("🛡️ BeamNG.drive Ultra Mod Theft Inspector")
+st.write("Upload ONE suspect mod ZIP and check it against MULTIPLE original mod ZIPs for a complete forensic audit.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -34,21 +34,37 @@ def get_all_file_hashes(extract_path):
                 pass
     return hashes
 
-def extract_jbeam_nodes(jbeam_path):
+def extract_jbeam_nodes_and_subsystems(jbeam_path):
     nodes = []
+    torque_curves = []
+    part_names = []
     try:
         with open(jbeam_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = [line.split('//')[0] for line in f.readlines()]
             content = "".join(lines)
             data = json.loads(content)
             for part_key, part_val in data.items():
-                if isinstance(part_val, dict) and "nodes" in part_val:
-                    for node in part_val["nodes"]:
-                        if isinstance(node, list) and len(node) >= 4 and isinstance(node[1], (int, float)):
-                            nodes.append([node[1], node[2], node[3]])
+                if isinstance(part_val, dict):
+                    # Part Name
+                    if "information" in part_val and "name" in part_val["information"]:
+                        part_names.append(part_val["information"]["name"])
+                    
+                    # Nodes (Physics points like suspensions, exhaust mounts, chassis)
+                    if "nodes" in part_val:
+                        for node in part_val["nodes"]:
+                            if isinstance(node, list) and len(node) >= 4 and isinstance(node[1], (int, float)):
+                                nodes.append([node[1], node[2], node[3]])
+                    
+                    # Engine Torque Curves
+                    if "mainEngine" in part_val and "torque" in part_val["mainEngine"]:
+                        t_data = part_val["mainEngine"]["torque"]
+                        if isinstance(t_data, list):
+                            curve = [pt for pt in t_data if isinstance(pt, list) and len(pt) >= 2]
+                            if len(curve) > 3:
+                                torque_curves.append(curve)
     except Exception:
         pass
-    return nodes
+    return nodes, torque_curves, part_names
 
 def analyze_meshes(extract_path):
     mesh_stats = []
@@ -88,10 +104,9 @@ def check_code_similarity(orig_dir, susp_dir):
     code_matches = []
     orig_text_files = {}
     
-    # Read text/lua/json/jbeam files
     for root, _, files in os.walk(orig_dir):
         for f in files:
-            if f.endswith(('.lua', '.json', '.jbeam', '.cs')):
+            if f.endswith(('.lua', '.json', '.jbeam', '.cs', '.html', '.js')):
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, orig_dir)
                 try:
@@ -102,40 +117,67 @@ def check_code_similarity(orig_dir, susp_dir):
 
     for root, _, files in os.walk(susp_dir):
         for f in files:
-            if f.endswith(('.lua', '.json', '.jbeam', '.cs')):
+            if f.endswith(('.lua', '.json', '.jbeam', '.cs', '.html', '.js')):
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, susp_dir)
                 try:
                     with open(full_path, 'r', encoding='utf-8', errors='ignore') as fp:
                         susp_text = fp.read()
-                        if len(susp_text) > 50:  # Ignore tiny files
+                        if len(susp_text) > 50:
                             for o_path, o_text in orig_text_files.items():
                                 if len(o_text) > 50:
                                     ratio = difflib.SequenceMatcher(None, o_text, susp_text).ratio()
-                                    if ratio > 0.80:  # 80%+ text similarity
+                                    if ratio > 0.80:
                                         code_matches.append((o_path, rel_path, ratio * 100))
                 except Exception:
                     pass
     return code_matches
 
+def check_material_paths(orig_dir, susp_dir):
+    path_matches = []
+    orig_folder_names = set()
+    
+    v_path = os.path.join(orig_dir, "vehicles")
+    if os.path.exists(v_path):
+        orig_folder_names = {f.lower() for f in os.listdir(v_path) if os.path.isdir(os.path.join(v_path, f))}
+
+    for root, _, files in os.walk(susp_dir):
+        for f in files:
+            if f in ('materials.json', 'materials.cs') or f.endswith('.jbeam'):
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, susp_dir)
+                try:
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as fp:
+                        content = fp.read().lower()
+                        for folder in orig_folder_names:
+                            if f"vehicles/{folder}" in content:
+                                path_matches.append((rel_path, folder))
+                except Exception:
+                    pass
+    return path_matches
+
 if susp_file and orig_files:
-    if st.button("Run Exhaustive Deep Inspection"):
-        with st.spinner("Running 6-layer forensic scan (Code, Audio, Geometry, Textures, Nodes, Materials)..."):
+    if st.button("Run Full Forensic Audit"):
+        with st.spinner("Scanning 3D Meshes, JBeams, Subsystems, Textures, Code, and Material Paths..."):
             with tempfile.TemporaryDirectory() as tmpdir:
                 susp_dir = os.path.join(tmpdir, "suspect")
                 with zipfile.ZipFile(susp_file, 'r') as z: z.extractall(susp_dir)
 
                 susp_hashes = get_all_file_hashes(susp_dir)
-                susp_nodes = []
+                
+                susp_nodes, susp_torque, susp_parts = [], [], []
                 for root, _, files in os.walk(susp_dir):
                     for f in files:
                         if f.endswith('.jbeam'):
-                            susp_nodes.extend(extract_jbeam_nodes(os.path.join(root, f)))
+                            n, t, p = extract_jbeam_nodes_and_subsystems(os.path.join(root, f))
+                            susp_nodes.extend(n)
+                            susp_torque.extend(t)
+                            susp_parts.extend(p)
                 
                 susp_meshes = analyze_meshes(susp_dir)
                 susp_tex = analyze_textures(susp_dir)
 
-                st.subheader("📊 Detailed Forensic Report")
+                st.subheader("📊 Complete Subsystem Audit Report")
                 
                 for idx, orig_file in enumerate(orig_files):
                     orig_dir = os.path.join(tmpdir, f"original_{idx}")
@@ -143,18 +185,17 @@ if susp_file and orig_files:
 
                     # 1. Exact Binary File Matches
                     orig_hashes = get_all_file_hashes(orig_dir)
-                    matching_hash_files = []
-                    for o_path, o_hash in orig_hashes.items():
-                        for s_path, s_hash in susp_hashes.items():
-                            if o_hash == s_hash:
-                                matching_hash_files.append((o_path, s_path))
+                    matching_hash_files = [(o, s) for o, oh in orig_hashes.items() for s, sh in susp_hashes.items() if oh == sh]
 
-                    # 2. JBeam Node Comparison
-                    orig_nodes = []
+                    # 2. JBeam Nodes & Curves
+                    orig_nodes, orig_torque, orig_parts = [], [], []
                     for root, _, files in os.walk(orig_dir):
                         for f in files:
                             if f.endswith('.jbeam'):
-                                orig_nodes.extend(extract_jbeam_nodes(os.path.join(root, f)))
+                                n, t, p = extract_jbeam_nodes_and_subsystems(os.path.join(root, f))
+                                orig_nodes.extend(n)
+                                orig_torque.extend(t)
+                                orig_parts.extend(p)
 
                     node_match_pct = 0.0
                     if orig_nodes and susp_nodes:
@@ -163,21 +204,18 @@ if susp_file and orig_files:
                         matches = sum(1 for pt in orig_arr if np.min(np.linalg.norm(susp_arr - pt, axis=1)) < 0.001)
                         node_match_pct = (matches / len(orig_arr)) * 100
 
-                    # 3. 3D Meshes (.dae)
+                    # Check Torque Curves & Part Names
+                    torque_matches = [ot for ot in orig_torque if ot in susp_torque]
+                    part_matches = set(orig_parts) & set(susp_parts)
+
+                    # 3. 3D Meshes (.dae topology)
                     orig_meshes = analyze_meshes(orig_dir)
-                    flagged_meshes = []
-                    for o_path, o_v, o_f, o_ext in orig_meshes:
-                        for s_path, s_v, s_f, s_ext in susp_meshes:
-                            if o_v == s_v and o_f == s_f:
-                                flagged_meshes.append((o_path, s_path, o_v, o_f))
-                                break
+                    flagged_meshes = [(om[0], sm[0], om[1], om[2]) for om in orig_meshes for sm in susp_meshes if om[1] == sm[1] and om[2] == sm[2]]
 
-                    # 4. Textures & Skins
+                    # 4. Textures (Perceptual Hashing)
                     orig_tex = analyze_textures(orig_dir)
-                    stolen_skins = []
-                    stolen_general_tex = []
+                    stolen_skins, stolen_general_tex = [], []
                     skin_keywords = ['skin', 'livery', 'wrap', 'decal', 'color', 'paint']
-
                     for o_path, o_hash in orig_tex.items():
                         for s_path, s_hash in susp_tex.items():
                             if o_hash - s_hash < 5:
@@ -186,45 +224,56 @@ if susp_file and orig_files:
                                 else:
                                     stolen_general_tex.append((o_path, s_path))
 
-                    # 5. Code & Config Similarity (Fuzzy Text Matching)
+                    # 5. Code & Material Paths
                     code_matches = check_code_similarity(orig_dir, susp_dir)
+                    material_path_matches = check_material_paths(orig_dir, susp_dir)
 
-                    # Card Output
+                    # Display Card
                     with st.expander(f"📁 Comparison against: {orig_file.name}", expanded=True):
                         c1, c2, c3, c4 = st.columns(4)
                         c1.metric("JBeam Physics Overlap", f"{node_match_pct:.1f}%")
-                        c2.metric("Flagged 3D Parts", f"{len(flagged_meshes)}")
+                        c2.metric("Flagged 3D Parts (.dae)", f"{len(flagged_meshes)}")
                         c3.metric("Flagged Skins/Colors", f"{len(stolen_skins)}")
-                        c4.metric("Code/Config Overlap", f"{len(code_matches)}")
+                        c4.metric("Engine & Material Flags", f"{len(torque_matches) + len(material_path_matches)}")
 
-                        if node_match_pct > 30:
-                            st.markdown("### 🔧 JBeam Physics Skeleton")
-                            st.warning(f"⚠️ **Spatial Node Coordinate Overlap:** {node_match_pct:.1f}% match.")
+                        if len(torque_matches) > 0:
+                            st.markdown("### 🏎️ Copied Engine Curves")
+                            st.error(f"🚨 **Engine Torque Curve Match:** Found {len(torque_matches)} identical torque/power curve arrays.")
+
+                        if len(material_path_matches) > 0:
+                            st.markdown("### 📁 Legacy Material Path References")
+                            for file_path, folder in material_path_matches:
+                                st.error(f"🚨 Suspect file `{file_path}` explicitly references original folder path: `vehicles/{folder}/`.")
+
+                        if len(part_matches) > 0:
+                            st.markdown("### ⚙️ Identical Sub-Part Names")
+                            for p_name in part_matches:
+                                st.warning(f"• Component Slot Name Match: `{p_name}`")
 
                         if len(code_matches) > 0:
-                            st.markdown("### 📜 Modified Code / Config Files (.lua, .jbeam, .json)")
+                            st.markdown("### 📜 Code & UI Similarity (.lua, .json, .html)")
                             for orig_c, susp_c, pct in code_matches:
-                                st.write(f"• **Suspect File:** `{susp_c}` is **{pct:.1f}% identical** to Original `{orig_c}`")
+                                st.write(f"• `{susp_c}` is **{pct:.1f}% identical** to `{orig_c}`")
 
                         if len(flagged_meshes) > 0:
-                            st.markdown("### 🧩 Stolen 3D Mesh Parts (.dae)")
+                            st.markdown("### 🧩 Stolen 3D Mesh Geometry (.dae)")
                             for orig_m, susp_m, verts, faces in flagged_meshes:
-                                st.write(f"• **Part Model:** `{susp_m}` ↔ Original `{orig_m}` (*Vertices: {verts}, Faces: {faces}*)")
+                                st.write(f"• Part `{susp_m}` ↔ Original `{orig_m}` (*Vertices: {verts}, Faces: {faces}*)")
 
                         if len(stolen_skins) > 0:
-                            st.markdown("### 🎨 Stolen Skins, Liveries & Color Maps")
+                            st.markdown("### 🎨 Stolen Skins & Colors")
                             for orig_s, susp_s in stolen_skins:
-                                st.write(f"• **Skin/Livery:** `{susp_s}` ↔ Original `{orig_s}`")
+                                st.write(f"• `{susp_s}` ↔ Original `{orig_s}`")
 
                         if len(stolen_general_tex) > 0:
                             st.markdown("### 🖼️ Stolen General Textures")
                             for orig_t, susp_t in stolen_general_tex:
-                                st.write(f"• **Texture:** `{susp_t}` ↔ Original `{orig_t}`")
+                                st.write(f"• `{susp_t}` ↔ Original `{orig_t}`")
 
                         if len(matching_hash_files) > 0:
                             st.markdown("### 📄 Identical Binary / Audio / Asset Files")
                             for orig_h, susp_h in matching_hash_files:
-                                st.write(f"• **Exact Match:** `{susp_h}` ↔ Original `{orig_h}`")
+                                st.write(f"• `{susp_h}` ↔ Original `{orig_h}`")
 
-                        if node_match_pct <= 30 and len(flagged_meshes) == 0 and len(stolen_skins) == 0 and len(code_matches) == 0 and len(matching_hash_files) == 0:
+                        if node_match_pct <= 30 and len(flagged_meshes) == 0 and len(stolen_skins) == 0 and len(code_matches) == 0 and len(torque_matches) == 0 and len(material_path_matches) == 0 and len(matching_hash_files) == 0:
                             st.success(f"✅ Clean: No notable asset overlap found with `{orig_file.name}`.")
