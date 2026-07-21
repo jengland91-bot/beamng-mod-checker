@@ -5,11 +5,14 @@ import os
 import hashlib
 import tempfile
 import numpy as np
+import trimesh
+from PIL import Image
+import imagehash
 
-st.set_page_config(page_title="BeamNG Mod Anti-Theft Checker", layout="wide")
+st.set_page_config(page_title="BeamNG Comprehensive Mod Inspector", layout="wide")
 
-st.title("🚗 BeamNG.drive Mod Theft Inspector")
-st.write("Upload an original mod ZIP and a suspect mod ZIP to check for copied JBeam nodes or duplicate asset files.")
+st.title("🚗 BeamNG.drive Comprehensive Mod Inspector")
+st.write("Upload an original mod ZIP and a suspect mod ZIP to perform a multi-layer asset comparison.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -21,11 +24,14 @@ def get_file_hashes(extract_path):
     hashes = {}
     for root, _, files in os.walk(extract_path):
         for f in files:
-            if not f.endswith(('.jbeam', '.json', '.txt')):
+            if not f.endswith(('.jbeam', '.json', '.txt', '.dae', '.dds', '.png', '.jpg')):
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, extract_path)
-                with open(full_path, 'rb') as fp:
-                    hashes[rel_path] = hashlib.md5(fp.read()).hexdigest()
+                try:
+                    with open(full_path, 'rb') as fp:
+                        hashes[rel_path] = hashlib.md5(fp.read()).hexdigest()
+                except Exception:
+                    pass
     return hashes
 
 def extract_jbeam_nodes(jbeam_path):
@@ -44,9 +50,48 @@ def extract_jbeam_nodes(jbeam_path):
         pass
     return nodes
 
+def analyze_meshes(extract_path):
+    mesh_stats = []
+    for root, _, files in os.walk(extract_path):
+        for f in files:
+            if f.endswith('.dae'):
+                full_path = os.path.join(root, f)
+                try:
+                    scene = trimesh.load(full_path, force='mesh')
+                    if isinstance(scene, trimesh.Trimesh):
+                        meshes = [scene]
+                    elif isinstance(scene, trimesh.Scene):
+                        meshes = scene.geometry.values()
+                    else:
+                        meshes = []
+                    
+                    for m in meshes:
+                        if hasattr(m, 'vertices') and len(m.vertices) > 0:
+                            v_count = len(m.vertices)
+                            f_count = len(m.faces)
+                            extents = tuple(np.round(m.extents, 3)) if hasattr(m, 'extents') else (0,0,0)
+                            mesh_stats.append((v_count, f_count, extents))
+                except Exception:
+                    pass
+    return mesh_stats
+
+def analyze_textures(extract_path):
+    hashes = {}
+    for root, _, files in os.walk(extract_path):
+        for f in files:
+            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, extract_path)
+                try:
+                    with Image.open(full_path) as img:
+                        hashes[rel_path] = imagehash.phash(img)
+                except Exception:
+                    pass
+    return hashes
+
 if orig_file and susp_file:
-    if st.button("Run Theft Inspection"):
-        with st.spinner("Extracting and analyzing mod structures..."):
+    if st.button("Run Full Theft Inspection"):
+        with st.spinner("Analyzing JBeam, 3D Meshes, Textures, and Asset Hashes..."):
             with tempfile.TemporaryDirectory() as tmpdir:
                 orig_dir = os.path.join(tmpdir, "original")
                 susp_dir = os.path.join(tmpdir, "suspect")
@@ -54,10 +99,12 @@ if orig_file and susp_file:
                 with zipfile.ZipFile(orig_file, 'r') as z: z.extractall(orig_dir)
                 with zipfile.ZipFile(susp_file, 'r') as z: z.extractall(susp_dir)
 
+                # 1. Hashes
                 orig_hashes = get_file_hashes(orig_dir)
                 susp_hashes = get_file_hashes(susp_dir)
                 matching_hashes = set(orig_hashes.values()) & set(susp_hashes.values())
-                
+
+                # 2. JBeam
                 orig_nodes = []
                 for root, _, files in os.walk(orig_dir):
                     for f in files:
@@ -77,20 +124,60 @@ if orig_file and susp_file:
                     matches = sum(1 for pt in orig_arr if np.min(np.linalg.norm(susp_arr - pt, axis=1)) < 0.001)
                     node_match_pct = (matches / len(orig_arr)) * 100
 
-                st.subheader("Inspection Results")
-                res_col1, res_col2 = st.columns(2)
-                with res_col1:
-                    st.metric("JBeam Physics Overlap", f"{node_match_pct:.1f}%")
-                    if node_match_pct > 80:
-                        st.error("🚨 Critical: High probability of stolen/cloned JBeam structure!")
-                    elif node_match_pct > 40:
-                        st.warning("⚠️ Warning: Significant node overlap detected.")
-                    else:
-                        st.success("✅ Clean: JBeam structure appears distinct.")
+                # 3. 3D Meshes (.dae)
+                orig_meshes = analyze_meshes(orig_dir)
+                susp_meshes = analyze_meshes(susp_dir)
+                
+                stolen_meshes = 0
+                for om in orig_meshes:
+                    for sm in susp_meshes:
+                        # Match by identical vertex count, face count, and bounding box dimensions
+                        if om[0] == sm[0] and om[1] == sm[1] and om[2] == sm[2]:
+                            stolen_meshes += 1
+                            break
 
-                with res_col2:
-                    st.metric("Identical Raw Asset Files", f"{len(matching_hashes)}")
-                    if len(matching_hashes) > 0:
-                        st.error(f"🚨 Found {len(matching_hashes)} exact-match asset/texture files!")
-                    else:
-                        st.success("✅ Clean: No exact asset hash matches found.")
+                # 4. Texture Visual Hashes
+                orig_tex = analyze_textures(orig_dir)
+                susp_tex = analyze_textures(susp_dir)
+                
+                stolen_textures = []
+                for o_path, o_hash in orig_tex.items():
+                    for s_path, s_hash in susp_tex.items():
+                        if o_hash - s_hash < 5:  # Low distance means visually near-identical
+                            stolen_textures.append((o_path, s_path))
+
+                # --- Display Detailed Results ---
+                st.subheader("🔍 Inspection Summary")
+                
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("JBeam Overlap", f"{node_match_pct:.1f}%")
+                with c2:
+                    st.metric("Flagged 3D Meshes", f"{stolen_meshes}")
+                with c3:
+                    st.metric("Visually Copied Textures", f"{len(stolen_textures)}")
+                with c4:
+                    st.metric("Exact Asset Hashes", f"{len(matching_hashes)}")
+
+                st.markdown("---")
+                st.subheader("📋 Findings & Risk Analysis")
+
+                if node_match_pct > 75:
+                    st.error(f"🚨 **Critical JBeam Theft:** {node_match_pct:.1f}% of physics node coordinates match spatial position.")
+                elif node_match_pct > 30:
+                    st.warning(f"⚠️ **Partial JBeam Reuse:** {node_match_pct:.1f}% node overlap detected.")
+
+                if stolen_meshes > 0:
+                    st.error(f"🚨 **Meshslap / 3D Theft:** Detected {stolen_meshes} 3D geometry objects with identical vertex counts, face counts, and bounding dimensions.")
+
+                if len(stolen_textures) > 0:
+                    st.error(f"🚨 **Texture Theft:** Detected {len(stolen_textures)} visually identical texture image files.")
+                    with st.expander("View Copied Texture Filenames"):
+                        for orig_t, susp_t in stolen_textures:
+                            st.write(f"• Original: `{orig_t}` ↔ Suspect: `{susp_t}`")
+
+                if len(matching_hashes) > 0:
+                    st.error(f"🚨 **Exact File Duplication:** Found {len(matching_hashes)} raw files copied directly without modification.")
+
+                if node_match_pct <= 30 and stolen_meshes == 0 and len(stolen_textures) == 0 and len(matching_hashes) == 0:
+                    st.success("✅ **Clean:** No significant structural, 3D mesh, texture, or asset file overlaps were detected.")
