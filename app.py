@@ -5,6 +5,7 @@ import os
 import hashlib
 import tempfile
 import difflib
+import re
 import numpy as np
 import trimesh
 from PIL import Image
@@ -20,6 +21,17 @@ with col1:
     susp_file = st.file_uploader("Upload Suspect Mod (.zip)", type=["zip"])
 with col2:
     orig_files = st.file_uploader("Upload Original Mods (.zip)", type=["zip"], accept_multiple_files=True)
+
+def sanitize_jbeam_text(text):
+    """Strips comments and trailing commas so BeamNG's custom JSON format parses cleanly."""
+    # Remove block comments
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    # Remove line comments
+    lines = [line.split('//')[0] for line in text.splitlines()]
+    clean_text = "\n".join(lines)
+    # Remove trailing commas before closing braces/brackets
+    clean_text = re.sub(r',\s*([\]}])', r'\1', clean_text)
+    return clean_text
 
 def get_all_file_hashes(extract_path):
     hashes = {}
@@ -40,30 +52,45 @@ def extract_jbeam_nodes_and_subsystems(jbeam_path):
     part_names = []
     try:
         with open(jbeam_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = [line.split('//')[0] for line in f.readlines()]
-            content = "".join(lines)
-            data = json.loads(content)
+            raw_content = f.read()
+            clean_content = sanitize_jbeam_text(raw_content)
+            data = json.loads(clean_content)
+            
             for part_key, part_val in data.items():
                 if isinstance(part_val, dict):
                     # Part Name
-                    if "information" in part_val and "name" in part_val["information"]:
-                        part_names.append(part_val["information"]["name"])
+                    if "information" in part_val and isinstance(part_val["information"], dict):
+                        if "name" in part_val["information"]:
+                            part_names.append(str(part_val["information"]["name"]))
                     
-                    # Nodes (Physics points like suspensions, exhaust mounts, chassis)
-                    if "nodes" in part_val:
+                    # Nodes (Extract 3D coordinates safely)
+                    if "nodes" in part_val and isinstance(part_val["nodes"], list):
                         for node in part_val["nodes"]:
-                            if isinstance(node, list) and len(node) >= 4 and isinstance(node[1], (int, float)):
-                                nodes.append([node[1], node[2], node[3]])
+                            if isinstance(node, list) and len(node) >= 4:
+                                # Check if coordinates are numbers
+                                if all(isinstance(node[i], (int, float)) for i in (1, 2, 3)):
+                                    nodes.append([float(node[1]), float(node[2]), float(node[3])])
                     
                     # Engine Torque Curves
-                    if "mainEngine" in part_val and "torque" in part_val["mainEngine"]:
-                        t_data = part_val["mainEngine"]["torque"]
-                        if isinstance(t_data, list):
-                            curve = [pt for pt in t_data if isinstance(pt, list) and len(pt) >= 2]
-                            if len(curve) > 3:
-                                torque_curves.append(curve)
+                    if "mainEngine" in part_val and isinstance(part_val["mainEngine"], dict):
+                        if "torque" in part_val["mainEngine"]:
+                            t_data = part_val["mainEngine"]["torque"]
+                            if isinstance(t_data, list):
+                                curve = [pt for pt in t_data if isinstance(pt, list) and len(pt) >= 2]
+                                if len(curve) > 3:
+                                    torque_curves.append(curve)
     except Exception:
-        pass
+        # Fallback: Regex extraction for nodes if JSON parsing fails completely
+        try:
+            with open(jbeam_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                # Matches node array pattern: ["node_id", x, y, z]
+                matches = re.findall(r'\[\s*"[^"]+"\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)', content)
+                for m in matches:
+                    nodes.append([float(m[0]), float(m[1]), float(m[2])])
+        except Exception:
+            pass
+
     return nodes, torque_curves, part_names
 
 def analyze_meshes(extract_path):
@@ -201,8 +228,12 @@ if susp_file and orig_files:
                     if orig_nodes and susp_nodes:
                         orig_arr = np.array(orig_nodes)
                         susp_arr = np.array(susp_nodes)
-                        matches = sum(1 for pt in orig_arr if np.min(np.linalg.norm(susp_arr - pt, axis=1)) < 0.001)
-                        node_match_pct = (matches / len(orig_arr)) * 100
+                        # Normalize coordinate origins (center of mass) to ignore position shifts
+                        orig_arr_norm = orig_arr - np.mean(orig_arr, axis=0)
+                        susp_arr_norm = susp_arr - np.mean(susp_arr, axis=0)
+                        
+                        matches = sum(1 for pt in orig_arr_norm if np.min(np.linalg.norm(susp_arr_norm - pt, axis=1)) < 0.005)
+                        node_match_pct = (matches / len(orig_arr_norm)) * 100
 
                     # Check Torque Curves & Part Names
                     torque_matches = [ot for ot in orig_torque if ot in susp_torque]
@@ -235,6 +266,10 @@ if susp_file and orig_files:
                         c2.metric("Flagged 3D Parts (.dae)", f"{len(flagged_meshes)}")
                         c3.metric("Flagged Skins/Colors", f"{len(stolen_skins)}")
                         c4.metric("Engine & Material Flags", f"{len(torque_matches) + len(material_path_matches)}")
+
+                        if node_match_pct > 25:
+                            st.markdown("### 🔧 JBeam Physics Skeleton")
+                            st.warning(f"⚠️ **Spatial Node Coordinate Overlap:** {node_match_pct:.1f}% node coordinate match detected.")
 
                         if len(torque_matches) > 0:
                             st.markdown("### 🏎️ Copied Engine Curves")
@@ -275,5 +310,5 @@ if susp_file and orig_files:
                             for orig_h, susp_h in matching_hash_files:
                                 st.write(f"• `{susp_h}` ↔ Original `{orig_h}`")
 
-                        if node_match_pct <= 30 and len(flagged_meshes) == 0 and len(stolen_skins) == 0 and len(code_matches) == 0 and len(torque_matches) == 0 and len(material_path_matches) == 0 and len(matching_hash_files) == 0:
+                        if node_match_pct <= 25 and len(flagged_meshes) == 0 and len(stolen_skins) == 0 and len(code_matches) == 0 and len(torque_matches) == 0 and len(material_path_matches) == 0 and len(matching_hash_files) == 0:
                             st.success(f"✅ Clean: No notable asset overlap found with `{orig_file.name}`.")
